@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"regexp"
@@ -860,6 +861,7 @@ func (whisper *Whisper) UpdateManyForArchive(points []*TimeSeriesPoint, targetRe
 		}
 
 		currentPoints, points = extractPoints(points, now, archive.MaxRetention())
+		log.Printf("UpdateManyForArchive archive=%s, currentPoints=%v, points=%v", archive, formatTimeSeriesPointPointers(currentPoints), formatTimeSeriesPointPointers(points))
 
 		if len(currentPoints) == 0 {
 			continue
@@ -900,18 +902,44 @@ func (whisper *Whisper) UpdateManyForArchive(points []*TimeSeriesPoint, targetRe
 	return
 }
 
+func formatTimeSeriesPointPointers(pts []*TimeSeriesPoint) string {
+	var b strings.Builder
+	for i, pt := range pts {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		fmt.Fprintf(&b, "{Time:%s Value:%g}", formatIntTime(pt.Time), pt.Value)
+	}
+	return b.String()
+}
+
+func formatIntTimes(ts []int) string {
+	var b strings.Builder
+	for i, t := range ts {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(formatIntTime(t))
+	}
+	return b.String()
+}
+
 func (whisper *Whisper) archiveUpdateMany(archive *archiveInfo, points []*TimeSeriesPoint) error {
 	alignedPoints := alignPoints(archive, points)
+	log.Printf("archiveUpdateMany alignedPoints=%s", formatDataPoints(alignedPoints))
 	intervals, packedBlocks := packSequences(archive, alignedPoints)
+	log.Printf("archiveUpdateMany intervals=%s", formatIntTimes(intervals))
 
 	baseInterval := whisper.getBaseInterval(archive)
 	if baseInterval == 0 {
 		baseInterval = intervals[0]
 	}
+	log.Printf("archiveUpdateMany baseInterval=%d %s", baseInterval, formatIntTime(baseInterval))
 
 	for i := range intervals {
 		myOffset := archive.PointOffset(baseInterval, intervals[i])
 		bytesBeyond := int(myOffset-archive.End()) + len(packedBlocks[i])
+		log.Printf("archiveUpdateMany i=%d, interval=%s, myOffset=%d, bytesBeyond=%d", i, formatIntTime(intervals[i]), myOffset, bytesBeyond)
 		if bytesBeyond > 0 {
 			pos := len(packedBlocks[i]) - bytesBeyond
 			err := whisper.fileWriteAt(packedBlocks[i][:pos], myOffset)
@@ -984,15 +1012,24 @@ func alignPoints(archive *archiveInfo, points []*TimeSeriesPoint) []dataPoint {
 }
 
 func packSequences(archive *archiveInfo, points []dataPoint) (intervals []int, packedBlocks [][]byte) {
+	log.Printf("packSequences, archive.secondsPerPoint=%d", archive.secondsPerPoint)
 	intervals = make([]int, 0)
 	packedBlocks = make([][]byte, 0)
+	var previousInterval int
 	for i, point := range points {
-		if i == 0 || point.interval != intervals[len(intervals)-1]+archive.secondsPerPoint {
+		if i > 0 {
+			log.Printf("packSequences, i=%d, point.interval=%s, intervals[len(intervals)-1]+archive.secondsPerPoint=%s",
+				i, formatIntTime(point.interval), formatIntTime(intervals[len(intervals)-1]+archive.secondsPerPoint))
+		}
+		if i == 0 || point.interval != previousInterval+archive.secondsPerPoint {
 			intervals = append(intervals, point.interval)
 			packedBlocks = append(packedBlocks, point.Bytes())
+			log.Printf("packSequences, i=%d, adding interval and packedBlocks, intervals=%s", i, formatIntTimes(intervals))
 		} else {
+			log.Printf("packSequences, i=%d, adding packedBlocks only", i)
 			packedBlocks[len(packedBlocks)-1] = append(packedBlocks[len(packedBlocks)-1], point.Bytes()...)
 		}
+		previousInterval = point.interval
 	}
 	return
 }
@@ -1154,8 +1191,13 @@ func (whisper *Whisper) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, 
 	return whisper.FetchByAggregation(fromTime, untilTime, nil)
 }
 
+func formatIntTime(t int) string {
+	return time.Unix(int64(t), 0).Format("2006-01-02T15:04:05Z")
+}
+
 func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAggregationSpec) (timeSeries *TimeSeries, err error) {
 	now := int(Now().Unix()) // TODO: danger of 2030 something overflow
+	log.Printf("FetchByAggregation start, from=%s, until=%s, now=%s", formatIntTime(fromTime), formatIntTime(untilTime), formatIntTime(now))
 	if fromTime > untilTime {
 		return nil, fmt.Errorf("Invalid time interval: from time '%d' is after until time '%d'", fromTime, untilTime)
 	}
@@ -1175,6 +1217,7 @@ func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAgg
 	if untilTime > now {
 		untilTime = now
 	}
+	log.Printf("FetchByAggregation adjusted, from=%s, until=%s, now=%s", formatIntTime(fromTime), formatIntTime(untilTime), formatIntTime(now))
 
 	// TODO: improve this algorithm it's ugly
 	diff := now - fromTime
@@ -1189,6 +1232,7 @@ func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAgg
 			break
 		}
 	}
+	log.Printf("FetchByAggregation archive=%+v", archive)
 	// NOTE: base (i.e. the first) archive should have a nil aggregationSpec
 	if whisper.aggregationMethod == Mix && spec != nil && archive.aggregationSpec != nil && spec.String() != archive.aggregationSpec.String() {
 		return nil, fmt.Errorf("target aggregation %s not found", spec)
@@ -1196,6 +1240,7 @@ func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAgg
 
 	fromInterval := archive.Interval(fromTime)
 	untilInterval := archive.Interval(untilTime)
+	log.Printf("FetchByAggregation fromInterval=%d, untilInterval=%d", fromInterval, untilInterval)
 
 	var series []dataPoint
 	if whisper.compressed {
@@ -1221,6 +1266,7 @@ func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAgg
 		return &TimeSeries{fromInterval, untilInterval, step, values}, nil
 	} else {
 		baseInterval := whisper.getBaseInterval(archive)
+		log.Printf("FetchByAggregation baseInterval=%d", baseInterval)
 
 		if baseInterval == 0 {
 			step := archive.secondsPerPoint
@@ -1239,6 +1285,7 @@ func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAgg
 
 		fromOffset := archive.PointOffset(baseInterval, fromInterval)
 		untilOffset := archive.PointOffset(baseInterval, untilInterval)
+		log.Printf("FetchByAggregation fromOffset=%d, untilOffset=%d", fromOffset, untilOffset)
 
 		series, err = whisper.readSeries(fromOffset, untilOffset, archive)
 		if err != nil {
@@ -1482,6 +1529,17 @@ func (p timeSeriesPointsNewestFirst) Less(i, j int) bool {
 type dataPoint struct {
 	interval int
 	value    float64
+}
+
+func formatDataPoints(pts []dataPoint) string {
+	var b strings.Builder
+	for i, pt := range pts {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		fmt.Fprintf(&b, "{interval:%s value:%g}", formatIntTime(pt.interval), pt.value)
+	}
+	return b.String()
 }
 
 func (point *dataPoint) Bytes() []byte {
